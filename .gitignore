@@ -1,0 +1,26 @@
+# Keil MDK ignore files
+*.bat
+*.hex
+*.axf
+*.htm
+*.sct
+*.map
+*.uvoptx
+*.uvguix.*
+*.dep
+*.o
+*.d
+*.crf
+*.iex
+*.lnp
+*.bak
+*.lst
+JLinkLog.txt
+*.scvd
+
+# 忽略编译生成的文件夹（通常是这些名字，根据你实际情况调整）
+Objects/
+Listings/
+Output/
+DebugConfig/
+RTE/
