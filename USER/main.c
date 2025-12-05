@@ -10,34 +10,48 @@
 #include "24cxx.h"
 #include "ws2812.h"
 #include "ai_model.h"
-#include "hcsr04.h"  // 【新增】超声波驱动
-#include "lsens.h"   // 【新增】光敏驱动
+#include "hcsr04.h"
+#include "lsens.h"
 #include <stdio.h>
+#include "sdio_sdcard.h"
+#include "malloc.h"
+#include "ff.h"  
+#include "exfuns.h"
+#include "piclib.h"
 
 //-------------------- 全局变量和定义 --------------------//
 
-// --- EEPROM地址定义 ---
+// EEPROM地址
 #define EEPROM_ADDR_TEMP_H  0x01
 #define EEPROM_ADDR_TEMP_L  0x02
 #define EEPROM_ADDR_HUMI_H  0x03
 #define EEPROM_ADDR_HUMI_L  0x04
 #define EEPROM_ADDR_PM25_H  0x05
-#define EEPROM_ADDR_MAGIC   0x00 // 首次上电标志位
+#define EEPROM_ADDR_MAGIC   0x00 
 #define EEPROM_MAGIC_NUM    0xAA 
 
-// --- 系统状态枚举 ---
+// --- 系统设置枚举 ---
 typedef enum {
-    PARAM_TEMP_H,
+    PARAM_TEMP_H = 0,
     PARAM_TEMP_L,
     PARAM_HUMI_H,
     PARAM_HUMI_L,
-    PARAM_PM25_H
+    PARAM_PM25_H,
+    PARAM_EXIT // 【新增】退出状态
 } SettingParam_t;
 
-static u8 g_is_setting_mode = 0; // 0:监控模式, 1:设置模式
-static SettingParam_t g_current_param = PARAM_TEMP_H; // 当前设置项
+// --- 【新增】灯光工作模式枚举 ---
+typedef enum {
+    MODE_AUTO = 0,      // 自动/正常模式 (绿灯待机，报警闪烁)
+    MODE_EMERGENCY,     // 应急模式 (全白高亮，用于照明)
+    MODE_OFF            // 关闭模式 (待机熄灭，报警仍闪烁)
+} LightMode_t;
 
-// --- 阈值变量 (从EEPROM加载) ---
+static u8 g_is_setting_mode = 0; 
+static SettingParam_t g_current_param = PARAM_TEMP_H;
+static LightMode_t g_light_mode = MODE_AUTO; // 默认为自动模式
+
+// --- 阈值变量 ---
 static u16 temp_H = 30;  
 static u16 temp_L = 10;  
 static u16 humi_H = 80;  
@@ -45,11 +59,11 @@ static u16 humi_L = 40;
 static u16 pm25_H = 75;  
 
 // --- 报警状态标志 ---
-static u8 g_temp_alarm = 0;     // 温度报警
-static u8 g_humi_alarm = 0;     // 湿度报警
-static u8 g_pm_alarm = 0;       // PM浓度报警
-static u8 g_ai_alarm = 0;       // AI火灾预警 (最高级)
-static u8 g_security_alarm = 0; // 【新增】安防入侵报警 (次高级)
+static u8 g_temp_alarm = 0;
+static u8 g_humi_alarm = 0;
+static u8 g_pm_alarm = 0;
+static u8 g_ai_alarm = 0;       
+static u8 g_security_alarm = 0; 
 
 //-------------------- 函数声明 --------------------//
 void Load_Thresholds_From_EEPROM(void);
@@ -66,7 +80,7 @@ int main(void)
     u32 distance_mm = 0;
     u8 light_val = 0;
     
-    // --- 1. 硬件初始化 ---
+    // --- 硬件初始化 ---
     delay_init();
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
     uart_init(115200);
@@ -77,94 +91,66 @@ int main(void)
     AT24CXX_Init();
     PMS7003_Init();
     WS2812_Init();
-    ai_model_init(); // 初始化AI模型
-    
-    // 【新增】安防传感器初始化
+    ai_model_init();
     HCSR04_Init(); 
     Lsens_Init();  
     
-    // 初始化DHT11 (带错误提示)
     while(DHT11_Init()) {
         LCD_ShowString(30, 130, 200, 16, 16, (u8*)"DHT11 Error");
         delay_ms(500);
     }
     
-    // --- 2. 加载配置 ---
     Load_Thresholds_From_EEPROM();
 
-    // --- 3. 绘制静态UI框架 ---
     LCD_Clear(WHITE);
     POINT_COLOR = BLACK;
     LCD_ShowString(30, 10, 210, 16, 16, (u8*)"Warehouse Safety System");
-    LCD_ShowString(30, 300, 210, 16, 16, (u8*)"Design by: 23001040215"); // 您的署名
+    LCD_ShowString(30, 300, 210, 16, 16, (u8*)"Design by: yqy");
 
-    // --- 4. 主循环 ---
+    // --- 主循环 ---
     while(1)
     {
-        // ========================
-        // A. 数据采集 (Data Acquisition)
-        // ========================
+        // A. 数据采集
         DHT11_Read_Data(&temperature, &humidity);
         current_pm = PMS7003_Get_Data();
-        distance_mm = HCSR04_Get_Distance(); // 读取距离
-        light_val = Lsens_Get_Val();         // 读取光强(0-100)
+        distance_mm = HCSR04_Get_Distance(); 
+        light_val = Lsens_Get_Val();         
 
-        // ========================
-        // B. 逻辑处理 (Logic Processing)
-        // ========================
+        // B. 逻辑处理
+        Key_Process(); // 处理按键 (模式切换/阈值设置)
         
-        // 1. 物理按键处理
-        Key_Process();
-        
-        // 2. 安防逻辑判断 (非法入侵检测)
-        // 逻辑: 距离<50cm(有人靠近) 或者 光强>20(夜间出现异常亮光)
-        if (distance_mm < 500 || light_val > 100) {
-            g_security_alarm = 1;
-        } else {
-            g_security_alarm = 0;
-        }
+        // 安防逻辑
+        if (distance_mm < 500 || light_val > 200) g_security_alarm = 1;
+        else g_security_alarm = 0;
 
-        // 3. AI 火灾预警逻辑 (仅在有新PM数据时运行)
+        // AI 逻辑
         if(current_pm.is_new) { 
-             // 准备AI输入向量: [温度, 湿度, 0.3um颗粒数, 2.5um颗粒数]
              float ai_input_data[4]; 
              ai_input_data[0] = (float)temperature;
              ai_input_data[1] = (float)humidity;
              ai_input_data[2] = (float)current_pm.particles_0_3um;
              ai_input_data[3] = (float)current_pm.particles_2_5um;
              
-             // 执行AI推理
              int8_t anomaly_result = ai_model_predict(ai_input_data); 
-             
-             // 设定AI报警标志 (-1代表异常)
              if (anomaly_result == -1) g_ai_alarm = 1;
              else g_ai_alarm = 0;
         }
 
-        // 4. 常规环境阈值检查
         Alarm_Check_Env(temperature, humidity, current_pm.pm2_5_std);
         
-        // ========================
-        // C. 界面与执行 (UI & Actuators)
-        // ========================
-        
-        // 刷新LCD显示
+        // C. 界面与执行
         UI_Display_Main(temperature, humidity, current_pm.pm2_5_std, distance_mm, light_val);
+        Alarm_Update(); // 更新灯光和蜂鸣器
         
-        // 执行声光报警 (蜂鸣器+WS2812)
-        Alarm_Update();
-        
-        delay_ms(100); // 循环延时
+        delay_ms(100); 
     }
 }
 
 //-------------------- 辅助函数实现 --------------------//
 
-// 从EEPROM加载阈值
 void Load_Thresholds_From_EEPROM(void)
 {
     u8 magic = AT24CXX_ReadOneByte(EEPROM_ADDR_MAGIC);
-    
     if (magic == EEPROM_MAGIC_NUM) { 
         temp_H = AT24CXX_ReadOneByte(EEPROM_ADDR_TEMP_H);
         temp_L = AT24CXX_ReadOneByte(EEPROM_ADDR_TEMP_L);
@@ -172,7 +158,6 @@ void Load_Thresholds_From_EEPROM(void)
         humi_L = AT24CXX_ReadOneByte(EEPROM_ADDR_HUMI_L);
         pm25_H = AT24CXX_ReadOneByte(EEPROM_ADDR_PM25_H);
     } else { 
-        // 首次写入默认值
         AT24CXX_WriteOneByte(EEPROM_ADDR_TEMP_H, temp_H);
         AT24CXX_WriteOneByte(EEPROM_ADDR_TEMP_L, temp_L);
         AT24CXX_WriteOneByte(EEPROM_ADDR_HUMI_H, humi_H);
@@ -182,12 +167,11 @@ void Load_Thresholds_From_EEPROM(void)
     }
 }
 
-// 刷新LCD界面
 void UI_Display_Main(u8 temp, u8 humi, u16 pm2_5, u32 dist, u8 light)
 {
     char text_buffer[40];
 
-    // 1. 环境数据区
+    // 数据显示
     POINT_COLOR = BLACK;
     sprintf(text_buffer, "Temp: %d C   ", temp);
     LCD_ShowString(30, 40, 200, 16, 16, (u8*)text_buffer);
@@ -196,13 +180,12 @@ void UI_Display_Main(u8 temp, u8 humi, u16 pm2_5, u32 dist, u8 light)
     sprintf(text_buffer, "PM2.5: %d ug/m3  ", pm2_5);
     LCD_ShowString(30, 80, 210, 16, 16, (u8*)text_buffer);
     
-    // 2. 安防数据区 【新增】
     sprintf(text_buffer, "Dist: %d mm   ", dist);
     LCD_ShowString(30, 100, 200, 16, 16, (u8*)text_buffer);
     sprintf(text_buffer, "Light: %d %%   ", light);
     LCD_ShowString(30, 120, 200, 16, 16, (u8*)text_buffer);
 
-    // 3. AI状态指示
+    // AI状态
     if(g_ai_alarm) {
         POINT_COLOR = RED;
         LCD_ShowString(30, 150, 210, 16, 16, (u8*)"[AI ALERT: FIRE!]   ");
@@ -211,7 +194,13 @@ void UI_Display_Main(u8 temp, u8 humi, u16 pm2_5, u32 dist, u8 light)
         LCD_ShowString(30, 150, 210, 16, 16, (u8*)"[AI System: Normal] ");
     }
 
-    // 4. 阈值设置显示 (选中项高亮)
+    // 显示灯光模式
+    POINT_COLOR = BLUE;
+    if(g_light_mode == MODE_AUTO)      LCD_ShowString(160, 150, 100, 16, 16, (u8*)"Mode: AUTO ");
+    else if(g_light_mode == MODE_EMERGENCY) LCD_ShowString(160, 150, 100, 16, 16, (u8*)"Mode: LIGHT");
+    else                               LCD_ShowString(160, 150, 100, 16, 16, (u8*)"Mode: OFF  ");
+
+    // 阈值设置显示
     POINT_COLOR = BLACK;
     LCD_ShowString(30, 180, 200, 16, 16, (u8*)"-- Settings --");
     
@@ -238,16 +227,28 @@ void UI_Display_Main(u8 temp, u8 humi, u16 pm2_5, u32 dist, u8 light)
     POINT_COLOR = BLACK; 
 }
 
-// 按键处理逻辑
+// 按键处理逻辑 (已更新)
 void Key_Process(void)
 {
     u8 key = KEY_Scan(0);
     
-    if (key == KEY0_PRES) { // KEY0: 切换/进入设置
-        g_is_setting_mode = 1; 
-        g_current_param = (SettingParam_t)((g_current_param + 1) % 5);
-    } else if (key == KEY1_PRES) { // KEY1: 增加
+    if (key == KEY0_PRES) { // KEY0: 菜单控制
+        if (!g_is_setting_mode) {
+            // 如果不在设置模式，进入设置模式
+            g_is_setting_mode = 1;
+            g_current_param = PARAM_TEMP_H;
+        } else {
+            // 如果在设置模式，切换下一个参数
+            g_current_param++;
+            // 如果超过最后一个参数，退出设置模式
+            if (g_current_param >= PARAM_EXIT) {
+                g_is_setting_mode = 0;
+            }
+        }
+    } 
+    else if (key == KEY1_PRES) { // KEY1: 增加 / 切换灯光模式
         if (g_is_setting_mode) {
+            // 设置模式下：数值增加
             switch(g_current_param) {
                 case PARAM_TEMP_H: if(temp_H<99) temp_H++; AT24CXX_WriteOneByte(EEPROM_ADDR_TEMP_H, temp_H); break;
                 case PARAM_TEMP_L: if(temp_L<temp_H) temp_L++; AT24CXX_WriteOneByte(EEPROM_ADDR_TEMP_L, temp_L); break;
@@ -255,8 +256,13 @@ void Key_Process(void)
                 case PARAM_HUMI_L: if(humi_L<humi_H) humi_L++; AT24CXX_WriteOneByte(EEPROM_ADDR_HUMI_L, humi_L); break;
                 case PARAM_PM25_H: if(pm25_H<255) pm25_H++; AT24CXX_WriteOneByte(EEPROM_ADDR_PM25_H, pm25_H); break;
             }
+        } else {
+            // 【新增】监控模式下：切换灯光模式 (Auto -> Emergency -> Off)
+            g_light_mode++;
+            if (g_light_mode > MODE_OFF) g_light_mode = MODE_AUTO;
         }
-    } else if (key == WKUP_PRES) { // WK_UP: 减少
+    } 
+    else if (key == WKUP_PRES) { // WK_UP: 减少
         if (g_is_setting_mode) {
              switch(g_current_param) {
                 case PARAM_TEMP_H: if(temp_H>temp_L) temp_H--; AT24CXX_WriteOneByte(EEPROM_ADDR_TEMP_H, temp_H); break;
@@ -269,7 +275,6 @@ void Key_Process(void)
     }
 }
 
-// 检查环境阈值
 void Alarm_Check_Env(u8 temp, u8 humi, u16 pm2_5)
 {
     g_temp_alarm = (temp > temp_H || temp < temp_L);
@@ -277,18 +282,14 @@ void Alarm_Check_Env(u8 temp, u8 humi, u16 pm2_5)
     g_pm_alarm   = (pm2_5 > pm25_H);
 }
 
-// 更新报警执行器 (包含静音逻辑)
+// 报警逻辑 (已更新灯光模式)
 void Alarm_Update(void)
 {
     static u16 tick = 0;
     tick++;
+    BEEP = 0; // 强制静音
 
-    // ---------------------------------------------
-    // 【图书馆模式】强制静音：始终关闭蜂鸣器
-    // ---------------------------------------------
-    BEEP = 0; 
-
-    // 设置模式下：青色呼吸灯提示
+    // 设置模式：青色流水灯
     if (g_is_setting_mode) { 
         if(tick % 2 == 0) { 
             WS2812_Set_All_Color(0,0,0);
@@ -298,62 +299,64 @@ void Alarm_Update(void)
         return;
     }
 
-    // 报警优先级判断：AI > 安防 > PM > 温度 > 湿度
+    // --- 优先处理应急模式 ---
+    if (g_light_mode == MODE_EMERGENCY) {
+        // 应急模式：全白高亮常亮
+        WS2812_Set_All_Color(255, 255, 255); 
+        WS2812_Refresh();
+        return; 
+    }
+
+    // --- 报警逻辑 (即使是OFF模式，报警也会闪烁，确保安全) ---
     
-    // 1. AI 火灾预警 (红色爆闪)
+    // 1. AI 火灾 (红色爆闪)
     if (g_ai_alarm) { 
-        if (tick % 1 == 0) { // 极快闪烁
-            // BEEP = !BEEP; // (已注释：静音)
+        if (tick % 1 == 0) { 
             WS2812_Set_All_Color(255, 0, 0); 
             WS2812_Refresh();
-        } else {
-            WS2812_Clear();
-        }
+        } else { WS2812_Clear(); }
+        return;
     } 
-    // 2. 【新增】安防入侵报警 (紫色闪烁)
+    // 2. 安防入侵 (紫色闪烁)
     else if (g_security_alarm) {
-        if (tick % 5 == 0) { // 中速闪烁
-            // BEEP = !BEEP; // (已注释：静音)
-            WS2812_Set_All_Color(128, 0, 128); // 紫色 (RGB: 128,0,128)
+        if (tick % 5 == 0) { 
+            WS2812_Set_All_Color(128, 0, 128); 
             WS2812_Refresh();
-        } else if (tick % 5 == 1) {
-            WS2812_Clear();
-        }
+        } else if (tick % 5 == 1) { WS2812_Clear(); }
+        return;
     }
-    // 3. PM浓度超标 (橙色)
+    // 3. PM超标 (橙色)
     else if (g_pm_alarm) { 
         if (tick % 2 == 0) {
-            // BEEP = !BEEP; 
             WS2812_Set_All_Color(200, 60, 0); 
             WS2812_Refresh();
-        } else {
-            WS2812_Clear();
-        }
+        } else { WS2812_Clear(); }
+        return;
     } 
-    // 4. 温度超标 (黄色)
+    // 4. 温度 (黄色)
     else if (g_temp_alarm) {
         if (tick % 5 == 0) {
-            // BEEP = !BEEP; 
             WS2812_Set_All_Color(200, 100, 0); 
             WS2812_Refresh();
-        } else if (tick % 5 == 1) {
-            WS2812_Clear();
-        }
+        } else if (tick % 5 == 1) { WS2812_Clear(); }
+        return;
     } 
-    // 5. 湿度超标 (蓝色)
+    // 5. 湿度 (蓝色)
     else if (g_humi_alarm) {
         if (tick % 10 == 0) {
-            // BEEP = !BEEP; 
             WS2812_Set_All_Color(0, 0, 200); 
             WS2812_Refresh();
-        } else if (tick % 10 == 1) {
-            WS2812_Clear();
-        }
+        } else if (tick % 10 == 1) { WS2812_Clear(); }
+        return;
     } 
-    // 6. 一切正常 (绿色常亮)
-    else { 
-        // BEEP = 0; 
+
+    // --- 正常待机状态 ---
+    if (g_light_mode == MODE_AUTO) {
+        // 自动模式：绿色常亮
         WS2812_Set_All_Color(0, 50, 0); 
         WS2812_Refresh();
+    } else {
+        // 关闭模式：熄灭
+        WS2812_Clear();
     }
 }
