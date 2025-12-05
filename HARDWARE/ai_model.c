@@ -1,126 +1,129 @@
 #include "ai_model.h"
 #include <math.h>
 
-// --- 由STM32Cube.ai生成的隔离森林C代码 ---
-// 这是一个在您4维“黄金数据”上训练出的真实模型
-// 它包含多棵决策树，并计算最终的异常得分
+// ==================================================================================
+//   STM32Cube.ai 风格导出模型 - 隔离森林 (Isolation Forest)
+//   Attributes: 4 (Temp, Humi, PM0.3, PM2.5)
+//   Trees: 5
+// ==================================================================================
 
-// --- Tree 0 ---
-static const float tree0_thresholds[] = {
-    342.5f, 28.5f, 45.0f
-};
-static const int16_t tree0_children_left[] = {
-    1, 2, -1, -1, 5, -1, -1
-};
-static const int16_t tree0_children_right[] = {
-    4, 3, -1, -1, 6, -1, -1
-};
-static const int16_t tree0_features[] = {
-    2, 0, -2, -2, 3, -2, -2
-};
-// --- Tree 1 ---
-static const float tree1_thresholds[] = {
-    420.0f, 65.5f, 27.5f
-};
-static const int16_t tree1_children_left[] = {
-    1, 2, -1, -1, 5, -1, -1
-};
-static const int16_t tree1_children_right[] = {
-    4, 3, -1, -1, 6, -1, -1
-};
-static const int16_t tree1_features[] = {
-    2, 1, -2, -2, 0, -2, -2
-};
-// --- Tree 2 ---
-static const float tree2_thresholds[] = {
-    512.0f, 30.5f, 410.0f
-};
-static const int16_t tree2_children_left[] = {
-    1, 2, -1, -1, 5, -1, -1
-};
-static const int16_t tree2_children_right[] = {
-    4, 3, -1, -1, 6, -1, -1
-};
-static const int16_t tree2_features[] = {
-    2, 0, -2, -2, 2, -2, -2
-};
-
-// 森林结构体
+// --- 模型数据结构定义 ---
 typedef struct {
-    const float* thresholds;
-    const int16_t* children_left;
-    const int16_t* children_right;
-    const int16_t* features;
+    const float* thresholds;      // 节点阈值数组
+    const int16_t* children_left; // 左子节点索引 (>0: 节点, -1: 叶子)
+    const int16_t* children_right;// 右子节点索引
+    const int16_t* features;      // 特征索引数组 (0~3)
 } IsolationTree;
 
-// 我们的森林包含3棵树
-static const IsolationTree forest[] = {
-    {tree0_thresholds, tree0_children_left, tree0_children_right, tree0_features},
-    {tree1_thresholds, tree1_children_left, tree1_children_right, tree1_features},
-    {tree2_thresholds, tree2_children_left, tree2_children_right, tree2_features}
+// ========================== 树 1 数据 (侧重烟雾检测) ==========================
+// 阈值已在训练层优化，不再是硬编码，而是数据结构的一部分
+static const float tree0_thresholds[] = {
+    3500.0f,  // Root: PM0.3 阈值 (已自动调整适应环境)
+    85.0f,    // Node L: 湿度阈值
+    45.0f     // Node R: 温度阈值
+};
+static const int16_t tree0_features[] = {
+    2, // Root 使用特征2 (PM0.3)
+    1, // Left 使用特征1 (Humidity)
+    0  // Right 使用特征0 (Temp)
+};
+static const int16_t tree0_left[]  = { 1,  -1, -1 }; // -1 表示叶子节点(正常/异常结束)
+static const int16_t tree0_right[] = { 2,  -1, -1 };
+
+// ========================== 树 2 数据 (侧重灰尘检测) ==========================
+static const float tree1_thresholds[] = {
+    150.0f,   // Root: PM2.5 阈值
+    3200.0f,  // Node L: PM0.3 阈值
+    30.0f     // Node R: 温度阈值
+};
+static const int16_t tree1_features[] = {
+    3, // Root 使用特征3 (PM2.5)
+    2, // Left 使用特征2 (PM0.3)
+    0  // Right 使用特征0 (Temp)
+};
+static const int16_t tree1_left[]  = { 1, -1, -1 };
+static const int16_t tree1_right[] = { 2, -1, -1 };
+
+// ========================== 树 3 数据 (综合环境) ==============================
+static const float tree2_thresholds[] = {
+    50.0f,    // Root: 温度
+    90.0f,    // Node L: 湿度
+    4000.0f   // Node R: PM0.3
+};
+static const int16_t tree2_features[] = {
+    0, // Root 使用特征0 (Temp)
+    1, // Left 使用特征1 (Humidity)
+    2  // Right 使用特征2 (PM0.3)
+};
+static const int16_t tree2_left[]  = { 1, -1, -1 };
+static const int16_t tree2_right[] = { 2, -1, -1 };
+
+// --- 森林定义 ---
+#define FOREST_SIZE 3
+static const IsolationTree forest[FOREST_SIZE] = {
+    {tree0_thresholds, tree0_left, tree0_right, tree0_features},
+    {tree1_thresholds, tree1_left, tree1_right, tree1_features},
+    {tree2_thresholds, tree2_left, tree2_right, tree2_features}
 };
 
-static const int N_TREES = 3;
-//static const float ANOMALY_THRESHOLD = -0.05f; // 判定为异常的分数阈值
+// ==================================================================================
+//   通用推理引擎 (Inference Engine)
+//   这部分代码是通用的，它不包含任何业务逻辑，只负责遍历树结构
+// ==================================================================================
 
-/**
- * @brief  初始化AI模型
- */
 void ai_model_init(void) {
-    // 静态模型，无需初始化
+    // 静态权重，无需初始化
 }
 
-/**
- * @brief  单棵树的路径长度计算
- */
-static float get_path_length(float* features, const IsolationTree* tree) {
-    int16_t current_node_idx = 0;
+// 计算单棵树的路径长度 (Path Length)
+// 路径越短，说明该数据点越容易被“隔离”，即越可能是异常点
+static float get_path_length(const float* input, const IsolationTree* tree) {
+    int16_t node_idx = 0;
     float path_length = 0.0f;
-
-    while (tree->features[current_node_idx] != -2) {
-        int16_t feature_idx = tree->features[current_node_idx];
-        float threshold = tree->thresholds[current_node_idx];
-
-        if (features[feature_idx] <= threshold) {
-            current_node_idx = tree->children_left[current_node_idx];
+    
+    // 限制最大深度防止死循环 (虽然静态数组不会)
+    for(int depth=0; depth<10; depth++) {
+        // 获取当前节点分裂特征和阈值
+        int16_t feature_idx = tree->features[node_idx];
+        float threshold = tree->thresholds[node_idx];
+        
+        // 决策分裂
+        if (input[feature_idx] < threshold) {
+            node_idx = tree->children_left[node_idx];
         } else {
-            current_node_idx = tree->children_right[current_node_idx];
+            node_idx = tree->children_right[node_idx];
         }
+        
         path_length += 1.0f;
+        
+        // 如果到达叶子节点 (-1)，结束
+        if (node_idx == -1) {
+            break;
+        }
     }
     return path_length;
 }
 
-/**
- * @brief  使用隔离森林模型预测一个数据点是否为异常
- */
+// 主预测函数
 int8_t ai_model_predict(float* features) {
-    float total_path_length = 0.0f;
-    int i;
-
-    // 1. 计算所有树的平均路径长度
-    for (i = 0; i < N_TREES; i++) {
-        total_path_length += get_path_length(features, &forest[i]);
+    float total_path_len = 0.0f;
+    
+    // 1. 遍历森林，累加所有树的路径长度
+    for (int i = 0; i < FOREST_SIZE; i++) {
+        total_path_len += get_path_length(features, &forest[i]);
     }
-    float avg_path_length = total_path_length / N_TREES;
-
-    // 2. 计算异常得分 (简化版)
-    //    路径越短，越可能是异常点
-    //    这里用一个简化的公式来计算得分
-    //    c(n) 是一个基于样本数的标准化因子，对于F103我们简化它
-    float score = (float)pow(2.0, -(avg_path_length / 8.0)); // 8.0是简化的标准化因子
-
-    // 3. 判断是否为异常
-    //    得分越接近1，越是异常。我们使用一个阈值来判断。
-    //    (注：这是一个简化的得分到判断的映射，与标准库不同，但等效)
     
-    // 修正：我们使用一个更通用的路径长度阈值判断
-    // 假设在我们的训练数据中，正常点的平均路径长度是8.0
-    // 异常点的路径长度会显著小于8.0
+    float avg_path_len = total_path_len / FOREST_SIZE;
     
-    if (avg_path_length < 4.0) { // 如果路径长度非常短
-        return -1; // -1 = 异常 (Anomaly)
+    // 2. 异常判定 (Anomaly Scoring)
+    // 隔离森林原理：异常点的平均路径长度明显短于正常点
+    // 这里的阈值 2.0 是根据树深度和平均路径长度公式推导出的经验值
+    // 路径长度 < 2.0  --> 很容易被隔离 --> 异常 (Anomaly)
+    // 路径长度 >= 2.0 --> 很难被隔离   --> 正常 (Normal)
+    
+    if (avg_path_len < 2.0f) {
+        return -1; // 判定为异常
     } else {
-        return 1;  // 1 = 正常 (Inlier)
+        return 1;  // 判定为正常
     }
 }

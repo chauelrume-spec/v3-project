@@ -15,7 +15,7 @@ void HCSR04_Init(void)
 
     // ECHO: 下拉输入 (或浮空输入)
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_13;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPD;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
     GPIO_Init(GPIOB, &GPIO_InitStructure);
 }
 

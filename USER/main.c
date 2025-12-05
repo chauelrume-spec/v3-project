@@ -118,7 +118,7 @@ int main(void)
         
         // 2. 安防逻辑判断 (非法入侵检测)
         // 逻辑: 距离<50cm(有人靠近) 或者 光强>20(夜间出现异常亮光)
-        if (distance_mm < 500 || light_val > 20) {
+        if (distance_mm < 500 || light_val > 100) {
             g_security_alarm = 1;
         } else {
             g_security_alarm = 0;
